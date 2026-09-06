@@ -1,0 +1,17 @@
+{
+	"author": "saintlou",
+	"gitHubUrl": "https://github.com/saintlou",
+	"packages": [
+		{
+			"id": "81c91ae9-fcb4-4cfe-b606-7af837374f69",
+			"name": "Centri MyPropane Tank Monitor",
+			"category": "Integrations",
+			"location": "https://raw.githubusercontent.com/saintlou/hubitat-centri-mypropane/main/packageManifest.json",
+			"description": "Unsupported driver for the Centri / CentriConnect MyPropane cellular propane tank monitor. Polls the Centri REST API for tank level, battery, solar, temperature and LTE signal, and derives consumption and days-remaining locally. Not affiliated with Centri.",
+			"tags": [
+				"Integrations",
+				"Utility"
+			]
+		}
+	]
+}

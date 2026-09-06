@@ -1,0 +1,21 @@
+{
+	"packageName": "Centri MyPropane Tank Monitor",
+	"minimumHEVersion": "2.3.0",
+	"author": "saintlou",
+	"version": "1.0.0",
+	"dateReleased": "2026-09-05",
+	"licenseFile": "https://raw.githubusercontent.com/saintlou/hubitat-centri-mypropane/main/LICENSE",
+	"releaseNotes": "1.0.0 - Initial public release. Unsupported, provided as-is with no warranty. Not affiliated with Centri / CentriConnect.",
+	"documentationLink": "https://github.com/saintlou/hubitat-centri-mypropane/blob/main/README.md",
+	"communityLink": "https://community.hubitat.com/t/driver-centri-mypropane-cellular-propane-tank-monitor-unsupported/166087",
+	"drivers": [
+		{
+			"id": "3f62adbe-b389-489d-87af-de981548b6dd",
+			"name": "Centri MyPropane Tank Monitor",
+			"namespace": "platypus",
+			"location": "https://raw.githubusercontent.com/saintlou/hubitat-centri-mypropane/main/drivers/centri-mypropane-tank-monitor.groovy",
+			"required": true,
+			"version": "1.0.0"
+		}
+	]
+}
