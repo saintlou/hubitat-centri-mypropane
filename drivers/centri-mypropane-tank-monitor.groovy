@@ -35,7 +35,15 @@
  *  locally — the API reports level only, never usage.
  *
  *  Licence: MIT
- *  Version: 1.0.0
+ *  Version: 1.0.1
+ *
+ *  Changes:
+ *    1.0.1 (2026-10-06)
+ *      - Hub reboot no longer forces an immediate poll: if the last poll succeeded and
+ *        the next one is already known, initialize() re-arms it instead of calling the
+ *        API again (a firmware-update reboot had caused a 5th call in 24h).
+ *      - The "calls in the last 24h" count ignores calls from 23h45m-24h ago, so a poll
+ *        landing exactly one cycle after yesterday's no longer warns falsely.
  */
 
 import groovy.transform.Field
@@ -45,6 +53,7 @@ import groovy.transform.Field
 @Field static final BigDecimal VOLTS_MAX     = 4.00G   // treated as 100% (per Centri docs)
 @Field static final Integer    FALLBACK_SECS = 21600   // 6h fallback if NextPostTimeIso unusable
 @Field static final Integer    MAX_CALLS_DAY = 4       // Centri's documented per-device limit
+@Field static final Long       CALL_GRACE_MS = 900000L // 15 min: a poll exactly 24h after one is not "within" 24h
 
 metadata {
     definition(
@@ -157,7 +166,18 @@ void initialize() {
     // Watchdog re-arms the schedule if a poll is ever missed (hub reboot, failed callback).
     // It makes no API call itself unless genuinely overdue.
     runEvery1Hour("watchdog")
-    runIn(5, "poll")
+
+    // After a hub reboot, re-arm the known next poll instead of spending an API call now.
+    Long nextPoll = state.nextPollEpoch as Long
+    Long lastPoll = (state.lastPollEpoch ?: 0L) as Long
+    boolean recent = (now() - lastPoll) < (FALLBACK_SECS * 1000L)
+    if (nextPoll != null && recent && nextPoll > now() + 60000L) {
+        Integer secs = ((nextPoll - now()) / 1000L) as Integer
+        runIn(secs, "poll", [overwrite: true])
+        log.info "Centri MyPropane: last poll is recent; next poll re-armed in ${(secs / 60) as Integer} minutes"
+    } else {
+        runIn(5, "poll")
+    }
 }
 
 void debugOff() {
@@ -270,6 +290,7 @@ private void scheduleNextPoll(String nextPostIso) {
     }
 
     runIn(delay.intValue(), "poll", [overwrite: true])
+    state.nextPollEpoch = now() + delay * 1000L
     if (txtEnable) log.info "Centri MyPropane: next poll in ${(delay / 60).intValue()} minutes"
 }
 
@@ -410,7 +431,7 @@ private void recordCall() {
 }
 
 private Integer callsInLast24h() {
-    Long cutoff = now() - 86400000L
+    Long cutoff = now() - 86400000L + CALL_GRACE_MS
     return ((state.calls ?: []) as List).findAll { (it as Long) >= cutoff }.size()
 }
 
