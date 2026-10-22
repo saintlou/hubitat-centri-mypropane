@@ -35,9 +35,26 @@
  *  locally — the API reports level only, never usage.
  *
  *  Licence: MIT
- *  Version: 1.0.1
+ *  Version: 1.0.2
  *
  *  Changes:
+ *    1.0.2 (2026-10-21)
+ *      - Low-level alert: when tankLevel first reaches the low-level threshold, the driver
+ *        now logs an error (and an info line when it rises back above), so log-based
+ *        alerting such as a syslog forwarder can notify you. Previously it only set the
+ *        lowLevel attribute, which nothing reports unless a rule watches it. Likewise when
+ *        Centri's own alertStatus changes to an alert. Both can be switched off.
+ *      - Changing the low-level threshold re-evaluates lowLevel at once from the last
+ *        reading, without an API call.
+ *      - No more HTTP 429s from Centri's 4-calls-per-24h limit. The monitor posts at the
+ *        same times every day, so each poll lands almost exactly 24h after one from the
+ *        day before, and Centri rejected some by a fraction of a second. The 15-minute
+ *        retry then counted as a 5th call and kept the count at the limit for a day.
+ *        Now a scheduled poll first checks the calls made in the last 24h: if four are
+ *        already there, it waits until the oldest is 24h old (if that is within the
+ *        hour), otherwise skips to the next cycle. A 429 is no longer counted as a call
+ *        (Centri does not count it) and is retried once the oldest call ages out.
+ *        Manual Refresh still always polls.
  *    1.0.1 (2026-10-06)
  *      - Hub reboot no longer forces an immediate poll: if the last poll succeeded and
  *        the next one is already known, initialize() re-arms it instead of calling the
@@ -53,7 +70,9 @@ import groovy.transform.Field
 @Field static final BigDecimal VOLTS_MAX     = 4.00G   // treated as 100% (per Centri docs)
 @Field static final Integer    FALLBACK_SECS = 21600   // 6h fallback if NextPostTimeIso unusable
 @Field static final Integer    MAX_CALLS_DAY = 4       // Centri's documented per-device limit
-@Field static final Long       CALL_GRACE_MS = 900000L // 15 min: a poll exactly 24h after one is not "within" 24h
+@Field static final Long       DAY_MS        = 86400000L
+@Field static final Long       CAP_MARGIN_MS = 5000L   // wait until the oldest call is this much past 24h old
+@Field static final Long       MAX_WAIT_MS   = 3600000L // wait at most an hour for a slot; beyond that, skip a cycle
 
 metadata {
     definition(
@@ -126,6 +145,12 @@ metadata {
         input name: "lowLevelPct", type: "number", title: "Low-level threshold (%)",
               defaultValue: 30,
               description: "Drives the 'lowLevel' attribute. Independent of the alert levels set in the MyPropane app."
+        input name: "logLowLevel", type: "bool", title: "Log an error when the tank reaches the low-level threshold",
+              defaultValue: true,
+              description: "Once per crossing, plus an info line when it rises back above. Lets log-based alerting notify you."
+        input name: "logAlertStatus", type: "bool", title: "Log an error when Centri's alert status changes to an alert",
+              defaultValue: true,
+              description: "For the Low / Critical levels set in the MyPropane app."
         input name: "pollOffsetMin", type: "number", title: "Poll delay after device post (minutes)",
               defaultValue: 10,
               description: "Cushion so the reading has landed server-side before fetching."
@@ -148,6 +173,8 @@ void installed() {
 void updated() {
     log.info "Centri MyPropane: preferences updated"
     if (debugEnable) runIn(1800, "debugOff")
+    // Apply a changed threshold to the last known level now, without an API call.
+    if (state.lastLevel != null) evaluateLowLevel(state.lastLevel as BigDecimal)
     initialize()
 }
 
@@ -173,10 +200,10 @@ void initialize() {
     boolean recent = (now() - lastPoll) < (FALLBACK_SECS * 1000L)
     if (nextPoll != null && recent && nextPoll > now() + 60000L) {
         Integer secs = ((nextPoll - now()) / 1000L) as Integer
-        runIn(secs, "poll", [overwrite: true])
+        runIn(secs, "scheduledPoll", [overwrite: true])
         log.info "Centri MyPropane: last poll is recent; next poll re-armed in ${(secs / 60) as Integer} minutes"
     } else {
-        runIn(5, "poll")
+        runIn(5, "scheduledPoll")
     }
 }
 
@@ -188,6 +215,29 @@ void debugOff() {
 // ---------------------------------------------------------------- commands
 
 void refresh() { poll() }
+
+/**
+ * Every timed poll comes through here; manual Refresh/Poll call poll() directly.
+ * If four calls were already made in the last 24h, wait for the oldest to age out
+ * (when that is within MAX_WAIT_MS) rather than make a call Centri would reject.
+ */
+void scheduledPoll() {
+    Long wait = capWaitMs()
+    if (wait > 0L) {
+        if (wait <= MAX_WAIT_MS) {
+            Integer secs = Math.max(1L, (wait + 999L).intdiv(1000L)) as Integer
+            runIn(secs, "scheduledPoll", [overwrite: true])
+            state.nextPollEpoch = now() + secs * 1000L
+            log.info "Centri MyPropane: ${MAX_CALLS_DAY} calls in the last 24h; waiting ${secs} s for the oldest to age out"
+        } else {
+            runIn(FALLBACK_SECS, "scheduledPoll", [overwrite: true])
+            state.nextPollEpoch = now() + FALLBACK_SECS * 1000L
+            log.warn "Centri MyPropane: ${MAX_CALLS_DAY} calls already made in the last 24h; skipping this poll to stay within Centri's limit"
+        }
+        return
+    }
+    poll()
+}
 
 void poll() {
     if (!settings.userId || !settings.deviceId || !settings.deviceAuth) {
@@ -230,12 +280,16 @@ void watchdog() {
     Long last = state.lastPollEpoch ?: 0L
     if (now() - last > (FALLBACK_SECS * 1000L) + 900000L) {
         log.warn "Centri MyPropane: no successful poll in over 6h15m — re-arming"
-        runIn(5, "poll")
+        runIn(5, "scheduledPoll")
     }
 }
 
 void pollCallback(hubitat.scheduling.AsyncResponse resp, Map cbData) {
     try {
+        if (resp.status == 429) {
+            rejectedOverLimit()
+            return
+        }
         if (resp.hasError()) {
             fail("HTTP ${resp.status}: ${resp.errorMessage ?: 'no message'}")
             return
@@ -271,11 +325,28 @@ void pollCallback(hubitat.scheduling.AsyncResponse resp, Map cbData) {
     }
 }
 
+/**
+ * HTTP 429: Centri refused the call as over its daily limit. Centri does not count a
+ * refused call, so neither do we; retry once the oldest counted call ages out. If our
+ * own count says there is room (our count and Centri's disagree), don't retry quickly:
+ * fall back to the normal 6-hour cadence rather than risk repeated refusals.
+ */
+private void rejectedOverLimit() {
+    List calls = (state.calls ?: []) as List
+    if (calls) state.calls = calls.take(calls.size() - 1)
+    sendEvent(name: "apiStatus", value: "error: HTTP 429 (over Centri's daily limit)")
+    Long wait = capWaitMs()
+    Integer secs = (wait > 0L && wait <= MAX_WAIT_MS) ? (Math.max(60L, (wait + 999L).intdiv(1000L)) as Integer) : FALLBACK_SECS
+    runIn(secs, "scheduledPoll", [overwrite: true])
+    state.nextPollEpoch = now() + secs * 1000L
+    log.warn "Centri MyPropane: poll refused by Centri (HTTP 429, over its daily limit); retrying in ${(secs / 60) as Integer} minutes"
+}
+
 private void fail(String msg) {
     log.warn "Centri MyPropane: poll failed — ${msg}"
     sendEvent(name: "apiStatus", value: "error: ${msg}")
-    // Retry once in 15 minutes, then fall back to the normal cadence.
-    runIn(900, "poll")
+    // Retry once in 15 minutes (still subject to the call cap), then the normal cadence.
+    runIn(900, "scheduledPoll")
 }
 
 private void scheduleNextPoll(String nextPostIso) {
@@ -289,7 +360,7 @@ private void scheduleNextPoll(String nextPostIso) {
         delay = FALLBACK_SECS as Long
     }
 
-    runIn(delay.intValue(), "poll", [overwrite: true])
+    runIn(delay.intValue(), "scheduledPoll", [overwrite: true])
     state.nextPollEpoch = now() + delay * 1000L
     if (txtEnable) log.info "Centri MyPropane: next poll in ${(delay / 60).intValue()} minutes"
 }
@@ -309,13 +380,20 @@ private void processReading(Map rec) {
                   descriptionText: "Tank level is ${level}%")
         sendEvent(name: "gallonsRemaining", value: remaining, unit: unit,
                   descriptionText: "Approximately ${remaining} ${unit.toLowerCase()} remaining")
-        BigDecimal thresh = (lowLevelPct ?: 30) as BigDecimal
-        sendEvent(name: "lowLevel", value: (level <= thresh) ? "true" : "false")
+        evaluateLowLevel(level)
     }
 
     sendEvent(name: "tankSize",     value: size, unit: unit)
     sendEvent(name: "tankSizeUnit", value: unit)
+    String prevAlert = device.currentValue("alertStatus") as String
     sendEvent(name: "alertStatus",  value: alert, descriptionText: "Centri alert status: ${alert}")
+    if (logAlertStatus != false && prevAlert != null && alert != prevAlert) {
+        if (alert in ["No Alert", "Unknown"]) {
+            log.info "Centri MyPropane: Centri alert status cleared (${prevAlert} to ${alert})"
+        } else {
+            log.error "Centri MyPropane: Centri alert status is now ${alert} (tank at ${level}%)"
+        }
+    }
 
     // Battery: Centri documents 4.0V as full and 3.5V as critically low.
     BigDecimal volts = toNum(rec.BatteryVolts)
@@ -423,6 +501,22 @@ private void updateBurnRate(BigDecimal level, BigDecimal size, String unit) {
 
 // ---------------------------------------------------------------- helpers
 
+/** Sets lowLevel and logs once per crossing of the threshold, in either direction. */
+private void evaluateLowLevel(BigDecimal level) {
+    if (level == null) return
+    BigDecimal thresh = (lowLevelPct != null ? lowLevelPct : 30) as BigDecimal
+    String isLow  = (level <= thresh) ? "true" : "false"
+    String wasLow = device.currentValue("lowLevel") as String
+    sendEvent(name: "lowLevel", value: isLow,
+              descriptionText: (isLow == "true") ? "Tank at ${level}%, at or below ${thresh}%" : "Tank at ${level}%, above ${thresh}%")
+    if (logLowLevel == false || isLow == wasLow) return
+    if (isLow == "true") {
+        log.error "Centri MyPropane: low propane, tank at ${level}% (low-level threshold ${thresh}%)"
+    } else if (wasLow == "true") {
+        log.info "Centri MyPropane: tank at ${level}%, back above the low-level threshold (${thresh}%)"
+    }
+}
+
 private void recordCall() {
     List calls = (state.calls ?: []) as List
     calls << now()
@@ -430,8 +524,17 @@ private void recordCall() {
     state.calls = calls.findAll { (it as Long) >= cutoff }
 }
 
+/** How long until fewer than MAX_CALLS_DAY calls fall within the last 24h; 0 if there is room now. */
+private Long capWaitMs() {
+    Long cutoff = now() - DAY_MS
+    List recent = ((state.calls ?: []) as List).collect { it as Long }.findAll { it > cutoff }.sort()
+    if (recent.size() < MAX_CALLS_DAY) return 0L
+    Long oldest = recent[recent.size() - MAX_CALLS_DAY] as Long
+    return Math.max(0L, oldest + DAY_MS + CAP_MARGIN_MS - now())
+}
+
 private Integer callsInLast24h() {
-    Long cutoff = now() - 86400000L + CALL_GRACE_MS
+    Long cutoff = now() - DAY_MS
     return ((state.calls ?: []) as List).findAll { (it as Long) >= cutoff }.size()
 }
 

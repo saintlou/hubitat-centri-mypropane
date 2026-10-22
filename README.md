@@ -58,14 +58,26 @@ response and schedules the next poll about 10 minutes after the device's own nex
 picks up each reading as soon as it exists while staying inside the cap. It falls back to 6 hours
 if that timestamp is missing or implausible.
 
-A rolling 24-hour call count is exposed as `callsLast24h`. Manual **Refresh** always polls, but
-logs a warning if you're already at four.
+A rolling 24-hour call count is exposed as `callsLast24h`. Because the monitor posts at the same
+times every day, each poll lands almost exactly 24 hours after one from the day before, and Centri
+refuses a call that comes even a fraction of a second early (HTTP 429). So before each timed poll
+the driver checks the last 24 hours: if four calls are already there, it waits until the oldest is
+24 hours old (if that is within the hour), otherwise it skips a cycle. A refused call is not counted
+(Centri doesn't count it either) and is retried once the oldest call ages out. Manual **Refresh**
+always polls, but logs a warning if you're already at four.
 
 ## Attributes
 
 **Tank** - `tankLevel` (%), `gallonsRemaining`, `tankSize`, `tankSizeUnit`, `alertStatus`
 (`No Alert` / `Low Level` / `Critical Level`, from the thresholds you set in the app), `lowLevel`
 (`true`/`false`, from the threshold set in the driver).
+
+**Low-level logging** - when `tankLevel` first reaches the driver's low-level threshold, the
+driver logs an **error** once (and an info line when it rises back above, e.g. after a delivery);
+likewise when Centri's `alertStatus` changes to an alert. That lets log-based alerting, such as a
+syslog forwarder, notify you. Both are on by default and can be switched off in preferences.
+Changing the threshold re-evaluates `lowLevel` immediately from the last reading, without an
+API call.
 
 **Consumption, derived locally** - `usedSinceLastRead`, `usedTotal`, `dailyUseRate`,
 `daysRemaining`, `lastRefillDate`. The API reports level only and never usage, so these are
